@@ -194,11 +194,32 @@ Ray Serve LLM keeps the KV cache and token load views synchronized across ingres
 
 If the ingress router fails to route a request, Ray Serve LLM can send it to an available model replica. These requests may not follow KV-aware routing, reducing cache reuse until the router recovers. Fallback is automatic. Set `RAY_SERVE_INGRESS_REQUEST_ROUTER_METRICS_ENABLED=1` to monitor router failures and fallback requests.
 
+## KV-aware prefill/decode disaggregation
+
+For a single P/D model, deploy two applications:
+
+- `pd-backend` contains the prefill deployment and the decode deployment. Decode is the application ingress and exposes its native vLLM ASGI app.
+- `pd-router` is the public router. Each replica owns a tokenizer and separate prefill and decode KV trackers. It resolves backend handles by application and deployment name.
+
+Configure `KVAwareRouter` on both P and D. The router tokenizes a generation request, selects P using cache overlap and pending prefill work, and executes prefill through Ray. After prefill returns transfer metadata, it releases the P reservation and selects D using decode load. HAProxy forwards the original request and transfer metadata to D, which streams directly through HAProxy to the client. Reservations and lifecycle events remain separate for P and D and synchronize across public router replicas.
+
+Enable `RAY_SERVE_ENABLE_HA_PROXY=1` and `RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING=1` on the cluster. Application routers forward request bodies independently of `RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY`. Deploy the backend before the public router, using different route prefixes:
+
+```{literalinclude} ../../../../../release/llm_tests/kv_router_test/serve_pd_kv_router.yaml
+:language: yaml
+```
+
+The backend uses `build_pd_openai_app`; the independent router uses the internal `build_pd_router_app` builder. Set `backend_application`, `prefill_deployment`, and `decode_deployment` to the deployed backend names. The public router deployment is named `LLMRouter` for lifecycle callbacks. Configure its replica count through `ingress_deployment_config`.
+
+This path supports text-only OpenAI chat requests and single-string completions. It rejects client-supplied transfer parameters, truncated generation bodies, MoRIIO connectors (including nested connectors), and data parallelism. Keep both backend pools warm: use positive replica counts, or autoscaling with `min_replicas >= 1`. Other model routes, such as model metadata and tokenization, go directly to D without executing prefill.
+
+Tokenization, prefill execution, and decode selection share a deadline below `RAY_SERVE_HAPROXY_INGRESS_REQUEST_ROUTER_TIMEOUT_S` (5 seconds by default). Increase that cluster setting when prefill needs longer. Routing failures return an error; this P/D path cannot fall back to an arbitrary decode replica without transfer metadata.
+
 ## Limitations
 
 - **Direct streaming only.** `KVAwareRouter` inherits direct streaming's constraints, including one model per application and no LoRA- or multiplex-aware routing. See {ref}`direct-streaming-limitations`.
 - **No data-parallel deployments.** The router doesn't yet score individual data-parallel ranks. Support is planned.
-- **No prefill-decode disaggregation.** The router doesn't yet support disaggregated prefill and decode. Support is planned.
+- **P/D restrictions.** KV-aware P/D requires the separate router application described above, text-only prompts, and warm backend pools.
 
 ## See also
 

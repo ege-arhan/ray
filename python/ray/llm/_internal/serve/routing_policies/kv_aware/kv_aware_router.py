@@ -5,6 +5,7 @@ from typing import List, Optional
 from ray.llm._internal.serve.core.configs.llm_config import LLMConfig
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
     REQUEST_TOKEN_IDS_KWARG,
+    ROUTING_REQUEST_ID_KWARG,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_token_tracker import (
     get_kv_token_tracker,
@@ -49,7 +50,7 @@ class KVAwareRouter(MultiplexMixin, RequestRouter):
         process. When absent (e.g. the proxy's fallback router), KV-aware
         routing degrades to load-balanced selection instead of erroring.
         """
-        self._kv_token_tracker = get_kv_token_tracker()
+        self._kv_token_tracker = get_kv_token_tracker(self._deployment_id)
         if self._kv_token_tracker is None:
             logger.warning(
                 "No KVTokenTracker in this process (%s); KVAwareRouter "
@@ -116,7 +117,8 @@ class KVAwareRouter(MultiplexMixin, RequestRouter):
             for replica in candidate_replicas
         }
         selection = await self._kv_token_tracker.select_worker(
-            pending_request.metadata.request_id,
+            pending_request.kwargs.get(ROUTING_REQUEST_ID_KWARG)
+            or pending_request.metadata.request_id,
             token_ids,
             list(worker_id_to_replica),
             _get_expected_output_tokens(pending_request),

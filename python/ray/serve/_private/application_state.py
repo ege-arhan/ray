@@ -50,6 +50,7 @@ from ray.serve._private.usage import ServeUsageTag
 from ray.serve._private.utils import (
     DEFAULT,
     _callable_uses_multiplexing,
+    _is_router_application_target_class,
     check_obj_ref_ready_nowait,
     override_runtime_envs_except_env_vars,
     validate_route_prefix,
@@ -1761,6 +1762,9 @@ def build_serve_application(
         if (
             RAY_SERVE_ENABLE_HA_PROXY
             and app._ingress_request_router is None
+            and not _is_router_application_target_class(
+                app._bound_deployment.func_or_class
+            )
             and deployment_to_request_router_cls.get(
                 ingress_name, DEFAULT_REQUEST_ROUTER_PATH
             )

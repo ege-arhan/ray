@@ -13,6 +13,7 @@ from ray.serve._private.http_util import ASGIAppReplicaWrapper
 from ray.serve._private.utils import (
     _callable_uses_multiplexing,
     _is_router_application_class,
+    _is_router_application_target_class,
 )
 from ray.serve.deployment import Application, Deployment
 from ray.serve.exceptions import RayServeException
@@ -186,6 +187,7 @@ def build_app(
         RAY_SERVE_ENABLE_HA_PROXY
         and ingress_request_router is None
         and _has_custom_request_router(app._bound_deployment)
+        and not _is_router_application_target_class(app._bound_deployment.func_or_class)
     ):
         raise RayServeException(CUSTOM_INGRESS_REQUEST_ROUTER_UNSUPPORTED_ERROR)
 

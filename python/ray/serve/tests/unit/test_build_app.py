@@ -1091,5 +1091,27 @@ def test_build_app_router_application_requires_route_prefix(monkeypatch):
         built_app.validate_router_application()
 
 
+def test_custom_ingress_router_allowed_for_router_application_target(monkeypatch):
+    monkeypatch.setattr("ray.serve._private.build_app.RAY_SERVE_ENABLE_HA_PROXY", True)
+
+    @serve.deployment(
+        request_router_config=RequestRouterConfig(request_router_class=RoundRobinRouter)
+    )
+    class Backend:
+        _serve_router_application_target = True
+
+    built = build_app(
+        Backend.bind(),
+        name="backend",
+        make_deployment_handle=FakeDeploymentHandle.from_deployment,
+    )
+    assert (
+        built.deployments[
+            0
+        ]._deployment_config.request_router_config.get_request_router_class()
+        is RoundRobinRouter
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main(["-v", "-s", __file__]))

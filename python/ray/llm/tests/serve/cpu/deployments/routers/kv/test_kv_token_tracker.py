@@ -5,6 +5,9 @@ registration, ``KVAwareRouter`` binding to it, and the
 
 import asyncio
 import sys
+from collections import OrderedDict
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -28,15 +31,15 @@ from ray.serve.llm.request_router import KVAwareRouter
 
 @pytest.fixture(autouse=True)
 def reset_process_global():
-    set_kv_token_tracker(None)
+    kv_token_tracker._KV_TOKEN_TRACKERS.clear()
     yield
-    set_kv_token_tracker(None)
+    kv_token_tracker._KV_TOKEN_TRACKERS.clear()
 
 
 class _SpyTracker:
     """Records constructor kwargs; skips the real selection service + LongPoll."""
 
-    def __init__(self, *, indexer_threads, serve_deployment_id):
+    def __init__(self, *, indexer_threads, serve_deployment_id, routing_stage):
         self.indexer_threads = indexer_threads
         self.serve_deployment_id = serve_deployment_id
 
@@ -71,7 +74,7 @@ def test_build_registers_tracker(monkeypatch):
     id and registers it so the same-process router/ingress can reach it."""
     monkeypatch.setattr(kv_token_tracker, "KVTokenTracker", _SpyTracker)
     tracker = build_kv_token_tracker(_llm_config(), "dep-id")
-    assert get_kv_token_tracker() is tracker
+    assert get_kv_token_tracker("dep-id") is tracker
     assert tracker.serve_deployment_id == "dep-id"
 
 
@@ -85,8 +88,9 @@ def test_indexer_threads_from_config(monkeypatch):
 def test_router_binds_tracker():
     """KVAwareRouter picks up the tracker the LLMRouter registered."""
     sentinel = object()
-    set_kv_token_tracker(sentinel)
+    set_kv_token_tracker(sentinel, "dep-id")
     router = KVAwareRouter.__new__(KVAwareRouter)
+    router._deployment_id = "dep-id"
     router.initialize_state()
     assert router._kv_token_tracker is sentinel
 
@@ -198,10 +202,14 @@ async def test_lifecycle_booking_end_to_end():
         assert _active_requests(tracker, worker_id) == 1
 
         router = LLMRouter.__new__(LLMRouter)
-        router._kv_token_tracker = tracker
-        await router.on_lifecycle_events([("on_prefill_complete", ("req-e2e",))])
+        router._kv_token_trackers = {"dep-id": tracker}
+        await router.on_lifecycle_events(
+            [("on_prefill_complete", ("req-e2e",))], "dep-id"
+        )
         assert _active_requests(tracker, worker_id) == 1
-        await router.on_lifecycle_events([("on_request_completed", ("req-e2e",))])
+        await router.on_lifecycle_events(
+            [("on_request_completed", ("req-e2e",))], "dep-id"
+        )
         assert "req-e2e" not in tracker._requests
         assert _active_requests(tracker, worker_id) == 0
     finally:
@@ -210,13 +218,13 @@ async def test_lifecycle_booking_end_to_end():
 
 
 @pytest.mark.asyncio
-async def test_peer_trackers_converge_through_request_lifecycle():
+async def test_peer_lifecycle_sync():
     """One atomic selection is replicated so every selection service books the
     same request, applies prefill completion, and frees it."""
     pytest.importorskip("dynamo.llm")
 
-    routing = _NoLongPollTracker(ingress_replica_rank=0)
-    peer = _NoLongPollTracker(ingress_replica_rank=1)
+    routing = _NoLongPollTracker(ingress_replica_id="router-0")
+    peer = _NoLongPollTracker(ingress_replica_id="router-1")
     trackers = (routing, peer)
     worker_id = get_worker_id("engine-replica-0")
     token_ids = list(range(64))
@@ -263,6 +271,7 @@ async def test_peer_trackers_converge_through_request_lifecycle():
         assert len(set(loads)) == 1
         assert loads[0][0] == 1
         assert loads[0][1] > 0
+        assert loads[0][2] > 0
         assert all("req-bcast" in tracker._requests for tracker in trackers)
         assert peer._svc.create_reservation_calls[0]["lora_name"] == "adapter-a"
 
@@ -277,6 +286,18 @@ async def test_peer_trackers_converge_through_request_lifecycle():
         assert all(
             tracker._requests["req-bcast"].prefill_completed for tracker in trackers
         )
+
+        for tracker in trackers:
+            await tracker.on_decode_progress("req-bcast", 32)
+        await async_wait_for_condition(
+            lambda: all(
+                _worker_load(tracker, worker_id, "potential_decode_blocks")
+                < loads[0][2]
+                for tracker in trackers
+            ),
+            timeout=5,
+        )
+        assert all(_active_requests(tracker, worker_id) == 1 for tracker in trackers)
 
         completed = [("on_request_completed", ("req-bcast",))]
         for tracker in trackers:
@@ -302,7 +323,7 @@ async def test_delayed_self_broadcast_does_not_resurrect_completed_request():
     worker_id = get_worker_id("engine-replica-0")
     token_ids = list(range(64))
 
-    tracker = _NoLongPollTracker(ingress_replica_rank=0)
+    tracker = _NoLongPollTracker(ingress_replica_id="router-0")
     try:
         tracker._register_block_size(16, "engine-replica-0")
         await tracker._upsert_worker(
@@ -320,7 +341,7 @@ async def test_delayed_self_broadcast_does_not_resurrect_completed_request():
         )
         descriptor = {
             "request_id": "req-delayed-self",
-            "source_ingress_replica_rank": 0,
+            "source_ingress_replica_id": "router-0",
             "worker_id": selection["worker_id"],
             "dp_rank": selection["dp_rank"],
             "sequence_hashes": [1],
@@ -349,8 +370,8 @@ async def test_delayed_peer_broadcast_does_not_resurrect_completed_request():
     worker_id = get_worker_id("engine-replica-0")
     token_ids = list(range(64))
 
-    routing = _NoLongPollTracker(ingress_replica_rank=0)
-    peer = _NoLongPollTracker(ingress_replica_rank=1)
+    routing = _NoLongPollTracker(ingress_replica_id="router-0")
+    peer = _NoLongPollTracker(ingress_replica_id="router-1")
     trackers = (routing, peer)
     try:
         for tracker in trackers:
@@ -372,7 +393,7 @@ async def test_delayed_peer_broadcast_does_not_resurrect_completed_request():
         peer._svc = _RecordingSelectionService(peer._svc)
         descriptor = {
             "request_id": "req-delayed-peer",
-            "source_ingress_replica_rank": 0,
+            "source_ingress_replica_id": "router-0",
             "worker_id": selection["worker_id"],
             "dp_rank": selection["dp_rank"],
             "sequence_hashes": [1],
@@ -583,6 +604,61 @@ async def test_longpoll_tracks_membership(serve_instance):
         )
     finally:
         serve.delete(app_name, _blocking=True)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_booking_is_freed_when_rust_finishes():
+    """Cancellation must not lose a reservation that finishes after the await."""
+    tracker = KVTokenTracker.__new__(KVTokenTracker)
+    tracker._pending_tasks = set()
+    booked = asyncio.Event()
+    finish_booking = asyncio.Event()
+
+    async def booking():
+        booked.set()
+        await finish_booking.wait()
+        return {}
+
+    svc = SimpleNamespace(free_reservation=AsyncMock())
+    tracker._svc = svc
+    task = asyncio.create_task(tracker._await_booking(booking(), "attempt"))
+    await booked.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    finish_booking.set()
+    await asyncio.gather(*tracker._pending_tasks)
+    svc.free_reservation.assert_awaited_once_with("attempt")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_completion_keeps_pending_free():
+    """Removing local state must not orphan the Rust free on cancellation."""
+    tracker = KVTokenTracker.__new__(KVTokenTracker)
+    tracker._pending_tasks = set()
+    tracker._requests = {"attempt": SimpleNamespace(worker_id=1)}
+    tracker._completed_request_ids = OrderedDict()
+    tracker._lifecycle_cache = {}
+    tracker._request_ids_by_worker = {1: {"attempt"}}
+    freeing, finish_free = asyncio.Event(), asyncio.Event()
+
+    async def free_reservation(request_id):
+        freeing.set()
+        await finish_free.wait()
+
+    tracker._svc = SimpleNamespace(
+        free_reservation=AsyncMock(side_effect=free_reservation)
+    )
+    task = asyncio.create_task(tracker.on_request_completed("attempt"))
+    await freeing.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await tracker.on_request_completed("attempt")
+    assert tracker._pending_tasks
+    finish_free.set()
+    await asyncio.gather(*tracker._pending_tasks)
+    tracker._svc.free_reservation.assert_awaited_once_with("attempt")
 
 
 if __name__ == "__main__":

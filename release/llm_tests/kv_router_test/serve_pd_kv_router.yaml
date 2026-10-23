@@ -1,0 +1,42 @@
+# Two prefill and two decode replicas exercise KV-aware P/D routing and NIXL.
+applications:
+  - name: pd-backend
+    route_prefix: /pd-backend
+    import_path: ray.serve.llm:build_pd_openai_app
+    args: &pd_configs
+      prefill_config: &llm_config
+        model_loading_config:
+          model_id: qwen
+          model_source: Qwen/Qwen3-0.6B
+        deployment_config:
+          num_replicas: 2
+          ray_actor_options:
+            num_cpus: 0.5
+          request_router_config:
+            request_router_class: ray.serve.llm.request_router.KVAwareRouter
+        log_engine_metrics: false
+        engine_kwargs:
+          disable_log_stats: false
+          max_model_len: 4096
+          enforce_eager: true
+          gpu_memory_utilization: 0.4
+          enable_prefix_caching: true
+          enable_prompt_tokens_details: true
+          kv_transfer_config:
+            kv_connector: NixlConnector
+            kv_role: kv_both
+      decode_config:
+        <<: *llm_config
+        runtime_env:
+          env_vars:
+            RAY_SERVE_LLM_ENABLE_DECODE_BLOCK_PROGRESS: "1"
+  - name: pd-router
+    route_prefix: /
+    import_path: ray.llm._internal.serve.serving_patterns.prefill_decode.builder:build_pd_router_app
+    args:
+      <<: *pd_configs
+      backend_application: pd-backend
+      prefill_deployment: Prefill:qwen
+      decode_deployment: Decode:qwen
+      ingress_deployment_config:
+        num_replicas: 2

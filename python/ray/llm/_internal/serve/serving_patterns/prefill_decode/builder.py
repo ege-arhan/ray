@@ -1,7 +1,4 @@
-"""Using Ray Serve to deploy LLM models with P/D disaggregation.
-
-3-tier graph: ingress -> PDDecodeServer (decode config + engine) -> PDPrefillServer.
-"""
+"""P/D backend and independent KV-aware router application builders."""
 
 from typing import Any, Optional, Union
 
@@ -26,6 +23,15 @@ from ray.llm._internal.serve.core.ingress.ingress import (
 )
 from ray.llm._internal.serve.core.server.builder import build_llm_deployment
 from ray.llm._internal.serve.observability.logging import get_logger
+from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
+    KV_EVENTS_PORT_BASE_KEY,
+    KV_TOKEN_PORT_BASE_KEY,
+    PD_ROUTING_STAGE,
+    RoutingStage,
+)
+from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_router import (
+    is_kv_aware,
+)
 from ray.llm._internal.serve.serving_patterns.data_parallel.builder import (
     build_dp_deployment,
 )
@@ -35,6 +41,7 @@ from ray.llm._internal.serve.serving_patterns.prefill_decode.pd_server import (
     PDDecodeServer,
     PDPrefillServer,
 )
+from ray.serve.config import AutoscalingConfig
 from ray.serve.deployment import Application
 
 logger = get_logger(__name__)
@@ -161,7 +168,8 @@ class PDServingArgs(BaseModelExtended):
 def build_pd_openai_app(pd_serving_args: dict) -> Application:
     """Build a deployable application utilizing prefill/decode disaggregation.
 
-    3-tier graph: ingress -> PDDecodeServer -> PDPrefillServer.
+    KV-aware direct streaming returns the decode-rooted backend graph; deploy
+    build_pd_router_app separately. Other modes retain their existing ingress.
     """
     pd_config = PDServingArgs.model_validate(pd_serving_args)
 
@@ -170,6 +178,8 @@ def build_pd_openai_app(pd_serving_args: dict) -> Application:
             pd_config.ingress_deployment_config,
             pd_config.ingress_cls_config,
         )
+
+    kv_aware = _configure_pd_kv_aware(pd_config)
 
     prefill_dp_size = pd_config.prefill_config.engine_kwargs.get(
         "data_parallel_size", 1
@@ -199,6 +209,9 @@ def build_pd_openai_app(pd_serving_args: dict) -> Application:
             bind_kwargs={"prefill_server": prefill_deployment},
             deployment_cls=decode_cls,
         )
+        if kv_aware:
+            # Deployed separately from build_pd_router_app; D owns the native ASGI app.
+            return decode_deployment
         logger.info(
             "Direct streaming enabled for PD: "
             f"{decode_cls.__name__}=ingress, LLMRouter=ingress_request_router"
@@ -241,4 +254,103 @@ def build_pd_openai_app(pd_serving_args: dict) -> Application:
             else {}
         ),
         **ingress_cls_config.ingress_extra_kwargs,
+    )
+
+
+def _configure_pd_kv_aware(config: PDServingArgs) -> bool:
+    configs = (config.prefill_config, config.decode_config)
+    enabled = [is_kv_aware(c) for c in configs]
+    if not any(enabled):
+        return False
+    if not all(enabled):
+        raise ValueError(
+            "KV-aware P/D requires KVAwareRouter on both prefill and decode"
+        )
+    # P and D may be passed the same config object by Python callers.
+    config.prefill_config = config.prefill_config.model_copy(deep=True)
+    config.decode_config = config.decode_config.model_copy(deep=True)
+    configs = (config.prefill_config, config.decode_config)
+    from ray.llm._internal.serve.routing_policies.kv_aware.utils import (
+        validate_kv_connector,
+    )
+
+    for c in configs:
+        validate_kv_connector(c)
+    if not RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING:
+        raise ValueError("KV-aware P/D requires direct streaming")
+    from ray.serve._private.constants import RAY_SERVE_ENABLE_HA_PROXY
+
+    if not RAY_SERVE_ENABLE_HA_PROXY:
+        raise ValueError("KV-aware P/D requires RAY_SERVE_ENABLE_HA_PROXY=1")
+    for stage, c in zip((RoutingStage.PREFILL, RoutingStage.DECODE), configs):
+        if c.engine_kwargs.get("data_parallel_size", 1) != 1:
+            raise ValueError("KV-aware P/D does not support data parallelism")
+        c.experimental_configs[PD_ROUTING_STAGE] = stage.value
+        deployment = c.deployment_config
+        replicas = deployment.get("num_replicas")
+        if replicas == 0:
+            raise ValueError("KV-aware P/D requires warm prefill and decode pools")
+        if replicas is None or replicas == "auto":
+            autoscaling = deployment.get("autoscaling_config") or {}
+            if isinstance(autoscaling, AutoscalingConfig):
+                autoscaling = autoscaling.model_dump(exclude_unset=True)
+            if autoscaling.get("min_replicas", 1) < 1:
+                raise ValueError("KV-aware P/D requires min_replicas >= 1")
+            autoscaling.setdefault("min_replicas", 1)
+            deployment["autoscaling_config"] = autoscaling
+    config.decode_config.experimental_configs.setdefault(KV_EVENTS_PORT_BASE_KEY, 15557)
+    config.decode_config.experimental_configs.setdefault(KV_TOKEN_PORT_BASE_KEY, 17557)
+    return True
+
+
+class PDRouterArgs(PDServingArgs):
+    """Backend identity and configurations for the independent P/D router."""
+
+    backend_application: str = Field(min_length=1)
+    prefill_deployment: str = Field(min_length=1)
+    decode_deployment: str = Field(min_length=1)
+
+
+def build_pd_router_app(pd_serving_args: dict) -> Application:
+    """Build the public router for a separately deployed KV-aware P/D backend.
+
+    Deploy build_pd_openai_app at a different route prefix first. This app binds
+    only configurations and backend names, resolving both handles at runtime.
+    """
+    from ray.llm._internal.serve.constants import get_llm_serve_runtime_env
+    from ray.llm._internal.serve.core.ingress.builder import (
+        _get_tokenizing_router_runtime_env,
+    )
+    from ray.llm._internal.serve.core.ingress.pd_router import LLMPDRouter
+    from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
+        LLM_ROUTER_DEPLOYMENT_NAME,
+    )
+
+    config = PDRouterArgs.model_validate(pd_serving_args)
+    if not _configure_pd_kv_aware(config):
+        raise ValueError("P/D router application requires KVAwareRouter on both stages")
+    options = maybe_apply_llm_deployment_config_defaults(
+        {
+            "max_ongoing_requests": 1000,
+            "ray_actor_options": {
+                "num_cpus": 1,
+                "runtime_env": get_llm_serve_runtime_env(
+                    _get_tokenizing_router_runtime_env(config.decode_config)
+                ),
+            },
+        },
+        config.ingress_deployment_config,
+    )
+    if options.pop("name", LLM_ROUTER_DEPLOYMENT_NAME) != LLM_ROUTER_DEPLOYMENT_NAME:
+        raise ValueError(
+            "P/D router deployment must be named LLMRouter for lifecycle callbacks"
+        )
+    return serve.deployment(
+        LLMPDRouter, name=LLM_ROUTER_DEPLOYMENT_NAME, **options
+    ).bind(
+        backend_application=config.backend_application,
+        prefill_deployment=config.prefill_deployment,
+        decode_deployment=config.decode_deployment,
+        prefill_config=config.prefill_config,
+        decode_config=config.decode_config,
     )

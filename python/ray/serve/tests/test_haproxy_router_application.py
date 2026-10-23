@@ -1,4 +1,5 @@
 """HAProxy router applications, run against a real HAProxy and fake replicas."""
+
 import asyncio
 import contextlib
 import json
@@ -24,6 +25,7 @@ from ray.serve._private.constants import (
     RAY_SERVE_ENABLE_HA_PROXY,
     SERVE_INGRESS_ROUTER_REQUEST_PATH_HEADER,
     SERVE_ROUTER_APPLICATION_DIRECT_RESPONSE_HEADER,
+    SERVE_ROUTER_APPLICATION_NAME_HEADER,
     SERVE_ROUTER_APPLICATION_ORIGINAL_METHOD_HEADER,
 )
 from ray.serve._private.haproxy import (
@@ -256,6 +258,7 @@ def _fake_replica(port: int, name: str) -> uvicorn.Server:
             "query": request.url.query,
             "body": (await request.body()).decode(),
             "request_id": request.headers.get("x-request-id"),
+            "request_headers": dict(request.headers),
             "serve_headers": sorted(
                 k for k in request.headers if k.startswith("x-serve-")
             ),
@@ -458,7 +461,10 @@ async def test_post_dispatches_to_selected_replica(router_cluster):
         assert served["path"] == f"/v1/{app}/v1/chat/completions"
         assert served["query"] == "x=1"
         assert json.loads(served["body"]) == body
-        assert served["serve_headers"] == []
+        assert served["serve_headers"] == [SERVE_ROUTER_APPLICATION_NAME_HEADER]
+        assert (
+            served["request_headers"][SERVE_ROUTER_APPLICATION_NAME_HEADER] == "router"
+        )
         call = router.calls[-1]
         assert call["method"] == "POST"
         assert call["path"] == "/internal/route"
@@ -806,6 +812,65 @@ async def test_scaled_to_zero_router(with_fallback):
             assert resp.status_code == 503
             assert resp.headers["x-serve-reason"] == "router_unavailable"
             assert router.calls == []
+
+
+@pytest.mark.asyncio
+async def test_injects_pd_request_headers(router_cluster):
+    url, router, _ = router_cluster
+    headers = {
+        "x-serve-router-kv-token-key": "attempt-id",
+        "x-serve-router-kv-transfer-params": "eyJyZW1vdGVfZW5naW5lX2lkIjoiUCJ9",
+    }
+    router.response = (
+        200,
+        json.dumps(
+            {
+                "application": "model-a",
+                "replica_id": _replica_id("model-a", "a1"),
+                "request_headers": headers,
+            }
+        ),
+    )
+    resp = _chat(
+        url,
+        {"prompt": "hello"},
+        headers={
+            "x-serve-router-kv-token-key": "forged",
+            SERVE_ROUTER_APPLICATION_NAME_HEADER: "forged-router",
+        },
+    )
+    assert resp.status_code == 200
+    received = resp.json()["request_headers"]
+    assert all(received[k] == value for k, value in headers.items())
+    assert received[SERVE_ROUTER_APPLICATION_NAME_HEADER] == "router"
+    assert len(router.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_server_status_lookup_failure_rejects_decision(monkeypatch):
+    original = HAProxyApi._write_router_application_lua
+
+    def broken_status_lookup(self, backends):
+        path = original(self, backends)
+        if path:
+            with open(path) as f:
+                script = f.read()
+            script = script.replace(
+                "local status = core.backends",
+                'error("injected status lookup failure")\n        local status = core.backends',
+            )
+            with open(path, "w") as f:
+                f.write(script)
+        return path
+
+    monkeypatch.setattr(
+        HAProxyApi, "_write_router_application_lua", broken_status_lookup
+    )
+    async with _router_cluster() as (url, router, _):
+        router.decide("model-a", "a1")
+        response = _chat(url, {})
+        assert response.status_code == 503
+        assert response.headers["x-serve-reason"] == "replica_unavailable"
 
 
 if __name__ == "__main__":

@@ -9,12 +9,16 @@ from ray import serve
 from ray.llm._internal.serve.observability.logging import get_logger
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
     LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S,
+    ROUTER_DESTINATION_CONTEXT,
+    ROUTING_REQUEST_ID_CONTEXT,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_token_tracker import (
+    LifecycleEvent,
     get_llm_router_handle,
     get_worker_id,
 )
 from ray.llm._internal.serve.utils.server_utils import get_serve_request_id
+from ray.serve._private.common import DeploymentID
 from ray.serve.handle import DeploymentHandle
 
 logger = get_logger(__name__)
@@ -34,11 +38,17 @@ class LifecycleEventForwarder:
     the next one.
     """
 
-    def __init__(self, handle: DeploymentHandle, worker_id: int):
+    def __init__(
+        self,
+        handle: DeploymentHandle,
+        worker_id: int,
+        deployment_id: Optional[DeploymentID] = None,
+    ):
         self.handle = handle
         self.worker_id = worker_id
-        self._events: asyncio.Queue = asyncio.Queue()
-        self._delivery_task: Optional[asyncio.Task] = None
+        self.deployment_id = deployment_id
+        self._events: asyncio.Queue[LifecycleEvent] = asyncio.Queue()
+        self._delivery_task: Optional[asyncio.Task[None]] = None
 
     def report(self, method_name: str, *args) -> None:
         if self._delivery_task is None or self._delivery_task.done():
@@ -57,8 +67,11 @@ class LifecycleEventForwarder:
             try:
                 # return_exceptions so one failed replica cannot mask delivery
                 # to the rest; failures are logged and dropped below.
+                kwargs = (
+                    {"deployment_id": self.deployment_id} if self.deployment_id else {}
+                )
                 results = await self.handle.broadcast(
-                    "on_lifecycle_events", batch
+                    "on_lifecycle_events", batch, **kwargs
                 ).results_async(
                     timeout_s=LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S,
                     return_exceptions=True,
@@ -141,32 +154,42 @@ def enable_token_tracking(
     """Decorator adding KV-router request lifecycle tracking."""
 
     class TokenTrackingEngine(engine_cls):
-        _lifecycle_forwarder: Optional[LifecycleEventForwarder] = None
+        _lifecycle_forwarders = None
         _resolve_warned: bool = False
         _report_decode_progress: bool = report_decode_progress
 
         def _resolve_lifecycle_forwarder(self) -> Optional[LifecycleEventForwarder]:
-            if self._lifecycle_forwarder is None:
-                try:
-                    # The KVTokenTracker lives inside the LLMRouter, so
-                    # forward lifecycle events to its deployment handle method.
-                    handle = get_llm_router_handle()
-                    worker_id = get_worker_id(
-                        serve.get_replica_context().replica_id.unique_id
-                    )
-                    self._lifecycle_forwarder = LifecycleEventForwarder(
-                        handle, worker_id
-                    )
-                except Exception as e:
-                    # Warn once: resolution is retried per request until it succeeds.
-                    if not self._resolve_warned:
-                        self._resolve_warned = True
-                        logger.warning("KV token tracking disabled: %s", e)
-            return self._lifecycle_forwarder
+            destination = ROUTER_DESTINATION_CONTEXT.get()
+            if self._lifecycle_forwarders is None:
+                self._lifecycle_forwarders = {}
+            if destination in self._lifecycle_forwarders:
+                return self._lifecycle_forwarders[destination]
+            try:
+                # Resolve lazily so each routing destination has its own callback.
+                handle = (
+                    get_llm_router_handle(destination)
+                    if destination
+                    else get_llm_router_handle()
+                )
+                replica_id = serve.get_replica_context().replica_id
+                forwarder = LifecycleEventForwarder(
+                    handle,
+                    get_worker_id(replica_id.unique_id),
+                    deployment_id=(replica_id.deployment_id if destination else None),
+                )
+                self._lifecycle_forwarders[destination] = forwarder
+                return forwarder
+            except Exception as e:
+                # Warn once: resolution is retried per request until it succeeds.
+                if not self._resolve_warned:
+                    self._resolve_warned = True
+                    logger.warning("KV token tracking disabled: %s", e)
+                return None
 
         def shutdown(self, *args, **kwargs):
-            if self._lifecycle_forwarder is not None:
-                self._lifecycle_forwarder.close()
+            if self._lifecycle_forwarders is not None:
+                for forwarder in self._lifecycle_forwarders.values():
+                    forwarder.close()
             return super().shutdown(*args, **kwargs)
 
         async def generate(self, prompt, sampling_params, request_id, *args, **kwargs):
@@ -185,7 +208,9 @@ def enable_token_tracking(
                     yield output
                 return
 
-            lifecycle_request_id = get_serve_request_id() or request_id
+            lifecycle_request_id = (
+                ROUTING_REQUEST_ID_CONTEXT.get() or get_serve_request_id() or request_id
+            )
             tracker = RequestTokenTracker(
                 forwarder,
                 lifecycle_request_id,

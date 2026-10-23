@@ -121,6 +121,15 @@ def _is_router_application_class(obj: Any) -> bool:
         return False
 
 
+def _is_router_application_target_class(obj: Any) -> bool:
+    """Whether this ingress explicitly delegates HTTP selection to a router app."""
+    return (
+        isinstance(obj, type)
+        and inspect.getattr_static(obj, "_serve_router_application_target", False)
+        is True
+    )
+
+
 def asyncio_grpc_exception_handler(loop, context):
     """Exception handler to filter out false positive BlockingIOErrors from gRPC."""
     exc = context.get("exception")

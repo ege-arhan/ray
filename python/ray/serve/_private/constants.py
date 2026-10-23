@@ -453,6 +453,7 @@ SERVE_INGRESS_ROUTER_HEADER_PREFIX = "x-serve-router-"
 # Marks a router-application response that HAProxy should return directly to
 # the client instead of interpreting as an application/replica decision.
 SERVE_ROUTER_APPLICATION_DIRECT_RESPONSE_HEADER = "x-serve-router-direct-response"
+SERVE_ROUTER_APPLICATION_NAME_HEADER = "x-serve-router-application"
 
 # Original client method forwarded to a router application's internal decision
 # request. The decision transport itself always uses POST so it can carry a body.
